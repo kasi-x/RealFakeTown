@@ -75,8 +75,10 @@ commands will be added once the project grows scenes and tests.
   longest strip is under 6 m are pruned — unnamed alleys median ~5.7 m vs
   trunks ≥10 m — plus `--exclude-name 首都高速` for the elevated
   expressway) and **corridor** (`GRAPH_CORRIDOR_BAND=200`: only edges
-  within 200 m of the k-shortest 皇居→東京駅 bundle survive; ~21 nodes /
-  45 edges / 5.3 km in one component). Nodes within `GRAPH_MERGE_TOL`
+  within 200 m of the k-shortest 皇居→東京駅 bundle survive; then the
+  graph shrinks to `GRAPH_TARGET_NODES` (default 15) by repeatedly
+  removing the shortest edge that keeps 開始→駅 reachable — ~15 nodes /
+  24 edges / 4.2 km in one component). Nodes within `GRAPH_MERGE_TOL`
   (default 15 m) iteratively collapse into a single point — one junction,
   one node, edge endpoints snapped to it — and dead-end chains are peeled
   plus degree-2 nodes contracted into single polylines (OSM attributes

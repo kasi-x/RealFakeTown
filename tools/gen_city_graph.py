@@ -1193,6 +1193,8 @@ def simplify_graph(nodes, edges, protected):
         edges = [e for e in edges if e is not e1 and e is not e2]
         if u == w:
             # dual-carriageway lobe: both strips run to the same neighbour
+            edge_count[target] -= 2
+            edge_count[u] -= 2
             notes["peeled_edges"] += 2
             notes["lobes_peeled"] += 1
             alive.discard(target)
@@ -1227,9 +1229,8 @@ def simplify_graph(nodes, edges, protected):
             "component": e1["component"],
         }
         edges.append(merged)
+        # u and w each lose one touching edge and gain the merged one
         edge_count[target] -= 2
-        edge_count[u] += 1
-        edge_count[w] += 1
         alive.discard(target)
         nodes = [n for n in nodes if n["id"] != target]
         notes["contracted_nodes"] += 1
@@ -1262,6 +1263,47 @@ def simplify_graph(nodes, edges, protected):
         e["component"] = comp[e["a"]]
     stats = {"nodes_after": len(nodes), "edges_after": len(edges),
              "notes": dict(notes)}
+    return nodes, edges, stats
+
+
+def reduce_to_target(nodes, edges, protected, target, start_id, goal_id):
+    """Shrink the graph until it has at most `target` nodes: repeatedly
+    drop the shortest edge whose removal keeps 開始→駅 reachable, then
+    re-run the peel/contract simplification. Deterministic; stops early
+    when no candidate survives the connectivity check."""
+    removed = 0
+
+    def connected(edges_):
+        adj = defaultdict(list)
+        for e in edges_:
+            adj[e["a"]].append(e["b"])
+            adj[e["b"]].append(e["a"])
+        seen = {start_id}
+        stack = [start_id]
+        while stack:
+            u = stack.pop()
+            for v in adj.get(u, ()):
+                if v not in seen:
+                    seen.add(v)
+                    stack.append(v)
+        return goal_id in seen
+
+    while len(nodes) > target:
+        candidates = sorted(edges, key=lambda e: e["length"])
+        for e in candidates:
+            if {e["a"], e["b"]} & protected:
+                if len(protected) > 1:
+                    continue  # never strand an anchor node
+            trial = [x for x in edges if x is not e]
+            if not connected(trial):
+                continue
+            nodes, edges, _s = simplify_graph(nodes, trial, protected)
+            removed += 1
+            break
+        else:
+            break  # nothing can go without breaking 開始→駅
+    stats = {"target": target, "edges_removed": removed,
+             "nodes_after": len(nodes), "edges_after": len(edges)}
     return nodes, edges, stats
 
 
@@ -1639,6 +1681,9 @@ def main():
     ap.add_argument("--no-simplify", action="store_true",
                     help="keep the full corridor graph (skip dead-end peel "
                          "and degree-2 contraction)")
+    ap.add_argument("--target-nodes", type=int, default=15,
+                    help="reduce the simplified graph until at most this "
+                         "many nodes remain (shortest-safe-edge removal)")
     ap.add_argument("--end-frac", type=float, default=0.2)
     ap.add_argument("--k", type=int, default=3)
     ap.add_argument("--start", default=f"{DEFAULT_START[0]},{DEFAULT_START[1]}",
@@ -1736,6 +1781,16 @@ def main():
         print(f"  simplify: nodes {n0} -> {len(nodes)}, "
               f"edges {e0} -> {len(edges)}")
 
+    # --- shrink to the puzzle target (safest-edge removal)
+    red_stats = None
+    if not args.no_simplify and args.target_nodes > 0 \
+            and len(nodes) > args.target_nodes and sn0 and gn0:
+        prot = {n["id"] for n in (sn0, gn0) if n}
+        nodes, edges, red_stats = reduce_to_target(
+            nodes, edges, prot, args.target_nodes, sn0["id"], gn0["id"])
+        print(f"  reduce: {red_stats['edges_removed']} edges removed, "
+              f"nodes {red_stats['nodes_after']}")
+
     # --- corridor demo: 開始 -> 駅, k shortest paths on the final graph
     sn, sd = snap_node(nodes, proj(*start_ll), args.snap)
     gn, gd = snap_node(nodes, proj(*goal_ll), args.snap)
@@ -1771,6 +1826,7 @@ def main():
                    "excluded_names": args.exclude_name,
                    "corridor_band_m": args.corridor_band,
                    "osm": args.osm,
+                   "target_nodes": args.target_nodes,
                    "end_frac": args.end_frac, "origin_latlon": ORIGIN},
     }
     (out / "graph.geojson").write_text(
@@ -1784,6 +1840,7 @@ def main():
         "corridor_filter": cstats,
         "osm": osm_stats,
         "simplify": simp_stats,
+        "reduce": red_stats,
         "construction_notes": g["notes"],
         "intersections_merged": g["inter_nodes"],
         "graph": {
