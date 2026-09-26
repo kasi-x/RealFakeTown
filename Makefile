@@ -2,13 +2,18 @@
 #
 # Big files (SDK tarballs, CityGML) live in vendor/ and never enter git.
 # `make setup` prepares everything a fresh clone needs to open the project
-# in Unity; `make verify` runs a headless resolve + compile check.
+# in Unity; `make verify` runs a headless resolve + compile check;
+# `make graph` rebuilds the walkable graph from the corridor CityGML.
 
 UNITY        := /Applications/Unity/Hub/Editor/6000.3.8f1/Unity.app/Contents/MacOS/Unity
 SDK_TGZ      := vendor/PLATEAU-SDK-for-Unity-v4.3.0.0.tgz
 TOOLKITS_TGZ := vendor/PLATEAU-SDK-Toolkits-for-Unity-v2.3.0.2.tgz
 CITYGML_ZIP  := vendor/citygml/13101_chiyoda-ku_pref_2025_citygml_1_op.zip
 CITYGML_UDX  := vendor/citygml/udx
+
+# 丸の内回廊 (皇居東側〜東京駅) — 3rd-mesh tran tiles
+GRAPH_MESHES := 53394611 53394620 53394621 53394610
+GRAPH_OUT    := artifacts/city_graph
 
 SDK_URL      := https://github.com/Project-PLATEAU/PLATEAU-SDK-for-Unity/releases/download/v4.3.0/PLATEAU-SDK-for-Unity-v4.3.0.0.tgz
 TOOLKITS_URL := https://github.com/Project-PLATEAU/PLATEAU-SDK-Toolkits-for-Unity/releases/download/v2.3.0/PLATEAU-SDK-Toolkits-for-Unity-v2.3.0.2.tgz
@@ -19,7 +24,7 @@ CITYGML_URL       := https://assets.cms.plateau.reearth.io/assets/d1/e11ec4-3ad6
 CITYGML_PORTAL    := https://www.geospatial.jp/ckan/dataset/plateau-13101-chiyoda-ku-2025
 CITYGML_DOWNLOADS := $(HOME)/Downloads/$(notdir $(CITYGML_ZIP))
 
-.PHONY: setup sdk toolkits citygml verify
+.PHONY: setup sdk toolkits citygml verify graph
 setup: sdk citygml
 
 sdk: $(SDK_TGZ)
@@ -56,3 +61,9 @@ verify:
 	$(UNITY) -batchmode -projectPath . -quit -logFile /tmp/rft-unity-verify.log
 	@! grep -qE "error CS|Compilation failed" /tmp/rft-unity-verify.log
 	@echo "verify: OK (packages resolved, no compile errors)"
+
+# Walkable graph from CityGML (no Unity needed): GeoJSON + stats + SVG/PNG
+# render into $(GRAPH_OUT); curated copies for docs live in docs/concepts.
+graph: $(CITYGML_UDX)
+	python3 tools/gen_city_graph.py $(GRAPH_MESHES) --root vendor/citygml \
+		--bbox marunouchi --out $(GRAPH_OUT)

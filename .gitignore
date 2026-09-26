@@ -8,6 +8,8 @@
 # Big external assets (SDK tarballs, CityGML) — bootstrap with `make setup`
 /vendor/
 /vendor.meta
+# Derived graph artifacts (regenerate with `make graph`)
+/artifacts/
 .DS_Store
 .utmp/
 /[Ll]ibrary/
@@ -108,3 +110,6 @@ InitTestScene*.unity*
 
 # Auto-generated cache in Assets folder
 /[Aa]ssets/[Ss]ceneDependencyCache*
+
+# Python bytecode
+__pycache__/
