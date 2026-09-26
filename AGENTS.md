@@ -48,10 +48,12 @@ commands will be added once the project grows scenes and tests.
   the reference to an absolute path. To upgrade the SDK, update the URL and
   file names in the `Makefile` and the manifest reference together.
 - **CityGML data is never committed** (GB-scale per city). `make citygml`
-  unzips the 千代田区 2025 dataset into `vendor/citygml/`; if the zip is
-  missing anywhere, it falls back to a copy from `~/Downloads`, else it
-  prints the portal URL (https://www.mlit.go.jp/plateau/open-data). First
-  experiment area is **丸の内: 皇居〜東京駅** — the dataset's DEM meshes are
+  downloads the 千代田区 2025 dataset from the official PLATEAU portal
+  resource (URL in the Makefile; dataset page:
+  https://www.geospatial.jp/ckan/dataset/plateau-13101-chiyoda-ku-2025)
+  and unzips it into `vendor/citygml/`. If the direct download fails it
+  falls back to a copy in `~/Downloads`, else prints the dataset page.
+  First experiment area is **丸の内: 皇居〜東京駅** — the dataset's DEM meshes are
   `5339-45`/`5339-46` and Marunouchi straddles their boundary, so select the
   5th-mesh tiles in between in the SDK import map.
 - **基準座標系 (base coordinate system) must match the imported city**; for
