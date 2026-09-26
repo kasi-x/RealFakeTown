@@ -10,7 +10,8 @@ Construction (v1, topology-first):
   node  - 車道交差部 (TrafficArea function 1020) polygons. One real
           intersection is often split into several non-touching pieces, so
           pieces merge with a wider tolerance (max(tol, 10 m)) than the
-          street-level touch tolerance.
+          street-level touch tolerance; nodes within --merge-tol (default
+          15 m) collapse into one point and edge endpoints snap to it.
   edge  - 車道部 (1000/1010) polygons -> "strips". A strip's centerline is
           approximated by its farthest-vertex pair. Strip ends touching
           other strips / intersections become junctions, so edges come out
@@ -564,7 +565,7 @@ def load_city_polys(meshes, root, proj, bbox):
 
 # ------------------------------------------------------------ graph build
 
-def build_graph(data, tol, min_edge, end_frac=0.2):
+def build_graph(data, tol, min_edge, end_frac=0.2, merge_tol=15.0):
     inters = data["intersection"]
     strips = data["roadway"]
     walks = data["sidewalk"]
@@ -740,36 +741,53 @@ def build_graph(data, tol, min_edge, end_frac=0.2):
         e["sidewalk_area"] = strip_sid_area.get(e["strip"], 0.0)
         e["sidewalk_polys"] = strip_sid_count.get(e["strip"], 0)
 
-    # --- 7. merge nodes closer than 3 m (junction duplication cleanup);
-    # kind priority: intersection > junction > dead_end
-    merge_tol = 3.0
+    # --- 7. merge nodes closer than merge_tol (junction duplication
+    # cleanup; wide roads scatter strip endpoints tens of metres around the
+    # same junction); kind priority: intersection > junction > dead_end
     uf_n = UnionFind()
     for n in nodes:
         uf_n.find(n["id"])
-    cellg = defaultdict(list)
-    for n in nodes:
-        cellg[(int(n["pos"][0] // merge_tol),
-               int(n["pos"][1] // merge_tol))].append(n["id"])
-    for key, ids in cellg.items():
-        for dx in (-1, 0, 1):
-            for dy in (-1, 0, 1):
-                other = cellg.get((key[0] + dx, key[1] + dy), ())
-                for nid in ids:
-                    for oid in other:
-                        if nid == oid:
-                            continue
-                        p1 = nodes[nid]["pos"]
-                        p2 = nodes[oid]["pos"]
-                        if math.hypot(p1[0] - p2[0], p1[1] - p2[1]) <= merge_tol:
-                            uf_n.union(nid, oid)
+    # iterate merge -> centroid -> re-merge until stable, so the FINAL
+    # nodes are guaranteed pairwise farther than merge_tol
+    merge_passes = 0
+    while True:
+        pts = {}
+        for root, ids in uf_n.groups().items():
+            ms = [nodes[i]["pos"] for i in ids]
+            pts[root] = (sum(q[0] for q in ms) / len(ms),
+                         sum(q[1] for q in ms) / len(ms))
+        cellg = defaultdict(list)
+        for root, (px, py) in pts.items():
+            cellg[(int(px // merge_tol),
+                   int(py // merge_tol))].append(root)
+        merged_any = False
+        for key, roots in cellg.items():
+            for dx in (-1, 0, 1):
+                for dy in (-1, 0, 1):
+                    other = cellg.get((key[0] + dx, key[1] + dy), ())
+                    for r1 in roots:
+                        for r2 in other:
+                            if r1 == r2 or uf_n.find(r1) == uf_n.find(r2):
+                                continue
+                            p1, p2 = pts[r1], pts[r2]
+                            if math.hypot(p1[0] - p2[0],
+                                          p1[1] - p2[1]) <= merge_tol:
+                                uf_n.union(r1, r2)
+                                merged_any = True
+        merge_passes += 1
+        if not merged_any:
+            break
+    notes["merge_passes"] = merge_passes
     prio = {"intersection": 0, "junction": 1, "dead_end": 2}
     final_nodes = []
     remap_id = {}
     for root, ids in sorted(uf_n.groups().items(), key=lambda kv: kv[1][0]):
-        keep = min((nodes[i] for i in ids),
-                   key=lambda m: prio[m["kind"]])
+        members = [nodes[i] for i in ids]
+        keep = min(members, key=lambda m: prio[m["kind"]])
+        px = sum(m["pos"][0] for m in members) / len(members)
+        py = sum(m["pos"][1] for m in members) / len(members)
         nid = len(final_nodes)
-        final_nodes.append({"id": nid, "pos": keep["pos"],
+        final_nodes.append({"id": nid, "pos": (px, py),
                             "kind": keep["kind"]})
         for i in ids:
             remap_id[i] = nid
@@ -777,9 +795,25 @@ def build_graph(data, tol, min_edge, end_frac=0.2):
         e["a"] = remap_id[e["a"]]
         e["b"] = remap_id[e["b"]]
 
-    # --- 8. min-edge filter + drop nodes left isolated
+    # --- 8. snap edge endpoints onto the merged node positions (every
+    # junction becomes a single point), drop self-loops / slivers, then
+    # drop nodes left isolated
     kept = []
     for e in edges:
+        e["pts"][0] = final_nodes[e["a"]]["pos"]
+        e["pts"][-1] = final_nodes[e["b"]]["pos"]
+        dedup = [e["pts"][0]]
+        for q in e["pts"][1:]:
+            if math.hypot(q[0] - dedup[-1][0], q[1] - dedup[-1][1]) > 0.05:
+                dedup.append(q)
+        if len(dedup) < 2:
+            notes["sliver_edges_dropped"] += 1
+            continue
+        e["pts"] = dedup
+        e["length"] = polyline_length(e["pts"])
+        if e["a"] == e["b"]:
+            notes["self_loops_dropped"] += 1
+            continue
         if e["length"] < min_edge:
             notes["short_edges_dropped"] += 1
             continue
@@ -1324,7 +1358,7 @@ def selftest():
                     _poly_rect(70, 30, 72, 32)],
         "sidewalk": [_poly_rect(10, 6, 30, 8)],
     }
-    g = build_graph(data, tol=1.0, min_edge=3.0)
+    g = build_graph(data, tol=1.0, min_edge=3.0, merge_tol=3.0)
 
     kinds = Counter(n["kind"] for n in g["nodes"])
     assert kinds["intersection"] == 2, kinds   # I and merged I2 pair
@@ -1384,6 +1418,12 @@ def selftest():
     assert cstats["notes"]["dropped_off_corridor"] == 1, cstats
     assert cstats["notes"]["isolated_nodes_dropped"] == 2, cstats
 
+    # 15 m merge: the same fixture collapses further — street D (10 m from
+    # J) folds into the J node as a self-loop, one junction = one point
+    g15 = build_graph(data, tol=1.0, min_edge=3.0, merge_tol=15.0)
+    assert len(g15["nodes"]) == 3, g15["nodes"]
+    assert len(g15["edges"]) == 2, g15["edges"]
+
     # osm overlay: synthetic oneway way along the I->J street + one
     # crossing node — proximity and bearing matching only
     osm = {"elements": [
@@ -1423,6 +1463,8 @@ def main():
     ap.add_argument("--tol", type=float, default=1.0,
                     help="street-level touch tolerance in meters")
     ap.add_argument("--min-edge", type=float, default=3.0)
+    ap.add_argument("--merge-tol", type=float, default=15.0,
+                    help="merge nodes closer than this into one point (m)")
     ap.add_argument("--min-width", type=float, default=0.0,
                     help="keep only carriageway strips >= this width in m "
                          "(大通りフィルタ); 0 keeps everything")
@@ -1485,7 +1527,7 @@ def main():
 
     print("building graph ...")
     g = build_graph(data, tol=args.tol, min_edge=args.min_edge,
-                    end_frac=args.end_frac)
+                    end_frac=args.end_frac, merge_tol=args.merge_tol)
     nodes, edges = g["nodes"], g["edges"]
     start_ll, goal_ll = parse_latlon(args.start), parse_latlon(args.goal)
 
@@ -1553,6 +1595,7 @@ def main():
         "meshes": args.meshes,
         "bbox_lonlat": bbox,
         "params": {"tol_m": args.tol, "min_edge_m": args.min_edge,
+                   "merge_tol_m": args.merge_tol,
                    "min_width_m": args.min_width,
                    "excluded_names": args.exclude_name,
                    "corridor_band_m": args.corridor_band,

@@ -75,8 +75,11 @@ commands will be added once the project grows scenes and tests.
   longest strip is under 6 m are pruned — unnamed alleys median ~5.7 m vs
   trunks ≥10 m — plus `--exclude-name 首都高速` for the elevated
   expressway) and **corridor** (`GRAPH_CORRIDOR_BAND=200`: only edges
-  within 200 m of the k-shortest 皇居→東京駅 bundle survive; ~88 nodes /
-  121 edges / 8 km). `GRAPH_MIN_WIDTH=0 GRAPH_CORRIDOR_BAND=0` regenerates
+  within 200 m of the k-shortest 皇居→東京駅 bundle survive; ~54 nodes /
+  81 edges / 7.5 km in one component). Nodes within `GRAPH_MERGE_TOL`
+  (default 15 m) iteratively collapse into a single point — one junction,
+  one node, edge endpoints snapped to it. `GRAPH_MIN_WIDTH=0
+  GRAPH_CORRIDOR_BAND=0` regenerates
   the full 51 km graph. **OSM attribute overlay** (`--osm auto`, cached at
   `artifacts/city_graph/osm-cache.json`, `--refresh-osm` to re-download):
   PLATEAU tran has no oneway/crosswalk information, so edges borrow

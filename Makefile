@@ -20,6 +20,8 @@ GRAPH_OUT    := artifacts/city_graph
 # 皇居→東京駅 bundle (0 = keep everything the bbox clip left)
 GRAPH_MIN_WIDTH     ?= 6.0
 GRAPH_CORRIDOR_BAND ?= 200
+# nodes closer than this collapse into one junction point
+GRAPH_MERGE_TOL     ?= 15.0
 
 SDK_URL      := https://github.com/Project-PLATEAU/PLATEAU-SDK-for-Unity/releases/download/v4.3.0/PLATEAU-SDK-for-Unity-v4.3.0.0.tgz
 TOOLKITS_URL := https://github.com/Project-PLATEAU/PLATEAU-SDK-Toolkits-for-Unity/releases/download/v2.3.0/PLATEAU-SDK-Toolkits-for-Unity-v2.3.0.2.tgz
@@ -74,4 +76,4 @@ graph: $(CITYGML_UDX)
 	python3 tools/gen_city_graph.py $(GRAPH_MESHES) --root vendor/citygml \
 		--bbox marunouchi --min-width $(GRAPH_MIN_WIDTH) \
 		--exclude-name 首都高速 --corridor-band $(GRAPH_CORRIDOR_BAND) \
-		--out $(GRAPH_OUT)
+		--merge-tol $(GRAPH_MERGE_TOL) --out $(GRAPH_OUT)
