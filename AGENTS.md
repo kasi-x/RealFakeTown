@@ -22,12 +22,10 @@ Unity (toon-deformed at render time).
   `ProjectSettings/` next to this file).
 
 ```bash
-# One-time (and after every SDK version bump):
-./tools/fetch-plateau-sdk.sh          # downloads ~762 MB tarball into vendor/
-
-# Headless resolve + compile check (no GUI):
-/Applications/Unity/Hub/Editor/6000.3.8f1/Unity.app/Contents/MacOS/Unity \
-  -batchmode -projectPath . -quit -logFile /tmp/rft-unity.log
+make setup     # one-time (and after every version bump): fetches the ~762 MB
+               # PLATEAU SDK tarball and the 千代田区 CityGML into vendor/
+make verify    # headless resolve + compile check (no GUI); exits non-zero on errors
+make toolkits  # optional: PLATEAU SDK Toolkits tarball (not wired into the project)
 ```
 
 Open in Unity Hub → Open → this repo root for normal GUI work. Build/test
@@ -36,9 +34,10 @@ commands will be added once the project grows scenes and tests.
 ## Directory layout
 
 - `docs/` — design documents, `docs/concepts/` mockups
-- `tools/` — dev scripts (map mockup generator, SDK tarball fetcher)
-- `vendor/` — **gitignored**: PLATEAU SDK tarball fetched by
-  `tools/fetch-plateau-sdk.sh`
+- `tools/` — dev scripts (map mockup generator)
+- `vendor/` — **gitignored**: big external assets fetched by `make setup`
+  — `PLATEAU-SDK-for-Unity-v4.3.0.0.tgz`, `PLATEAU-SDK-Toolkits-*.tgz`
+  — `citygml/` — 千代田区 2025 CityGML (`udx/` extracted at `vendor/citygml/`)
 - `Assets/`, `Packages/`, `ProjectSettings/` — the Unity project
 
 ## Constraints & caveats
@@ -46,13 +45,16 @@ commands will be added once the project grows scenes and tests.
 - **PLATEAU SDK is installed as a local UPM tarball**: `Packages/manifest.json`
   references `file:../vendor/PLATEAU-SDK-for-Unity-v4.3.0.0.tgz` (relative
   paths resolve against `Packages/`). Never commit `vendor/`, never switch
-  the reference to an absolute path. To upgrade the SDK, update `version=`
-  in `tools/fetch-plateau-sdk.sh` and the manifest reference together.
-- **CityGML data is never committed** (hundreds of MB per city). It arrives
-  through the SDK's import window (G空間情報センター server import or local
-  CityGML). Check what the importer writes under `Assets/` and extend
-  `.gitignore` before the first real import.
-- **基準座標系 (base coordinate system) must match the imported city**; a
-  wrong value silently distorts the whole model.
+  the reference to an absolute path. To upgrade the SDK, update the URL and
+  file names in the `Makefile` and the manifest reference together.
+- **CityGML data is never committed** (GB-scale per city). `make citygml`
+  unzips the 千代田区 2025 dataset into `vendor/citygml/`; if the zip is
+  missing anywhere, it falls back to a copy from `~/Downloads`, else it
+  prints the portal URL (https://www.mlit.go.jp/plateau/open-data). First
+  experiment area is **丸の内: 皇居〜東京駅** — the dataset's DEM meshes are
+  `5339-45`/`5339-46` and Marunouchi straddles their boundary, so select the
+  5th-mesh tiles in between in the SDK import map.
+- **基準座標系 (base coordinate system) must match the imported city**; for
+  千代田区 choose **9系 (東京)**. A wrong value silently distorts the model.
 - `Library/`, `Temp/`, `Logs/`, `UserSettings/` are Unity-generated caches —
   never edit or commit them; they regenerate on open.
