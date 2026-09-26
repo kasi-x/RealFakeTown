@@ -24,10 +24,6 @@ Construction (v1, topology-first):
   corridor - --corridor-band M keeps only edges within M m of the union of
           the k-shortest 開始→駅 paths (回廊フィルタ; 0 = off). Nodes left
           without edges are removed and degrees/components re-annotated.
-  patch  - the 内堀通り gap (宮内庁管理道路, absent from PLATEAU tran:
-          zero carriageway polygons along the east moat) is bridged by a
-          hand-traced synthetic strip MOAT_PATCH (marked patch=True,
-          --no-patch to disable). The default start is 大手門.
   CRS   - input is EPSG:6697 (lat, lon, z per the axis order in the files);
           treated as WGS84 and projected to local meters around Marunouchi.
 
@@ -81,21 +77,12 @@ MARUNOUCHI_BBOX = (139.7490, 35.6770, 139.7725, 35.6900)
 # local-meter projection origin (丸の内 center-ish, deterministic)
 ORIGIN = (35.6825, 139.7605)
 
-# 皇居東側の内堀通り(大手門〜データ西端 ~700m)は宮内庁管理道路のため
-# PLATEAU tran に存在しない(実測: 同帯に車道部ポリゴンはゼロ、あるのは
-# 上空の首都高速のみ)。下の手書き補助線(MOAT_PATCH)で接続し、開始点は
-# 大手門に置く。パッチ区間は出力で patch=True として実データと区別する。
-MOAT_PATCH = [  # (lat, lon) 大手門 → 都道301号/日比谷通り データ西端
-    (35.68483, 139.75310),  # 大手門
-    (35.68515, 139.75460),
-    (35.68540, 139.75620),
-    (35.68560, 139.75780),
-    (35.68550, 139.75920),
-    (35.68485, 139.76090),  # 都道301号交差部ポリゴン群の中心に食い込ませる
-]
-MOAT_PATCH_WIDTH = 10.0  # synthetic carriageway width (m)
-
-DEFAULT_START = (35.68483, 139.75310)  # 大手門 (via MOAT_PATCH)
+# 注意: 皇居東側の内堀通り(lon 139.753-139.760, 大手門〜パレスホテル前)は
+# 宮内庁管理道路のため PLATEAU tran に存在しない(実測: 同帯に車道部ポリゴン
+# はゼロ、あるのは上空の首都高速のみ。GセンターCKAN にも宮内庁データ無し)。
+# グラフ西端の道路は パレスホテル前(丸の内1-1, 日比谷通り沿い)に当たり、
+# 開始点はそこに置く。門側(大手門〜)は盤面側で手配置する。
+DEFAULT_START = (35.68550, 139.76105)  # パレスホテル前 (丸の内1-1)
 DEFAULT_GOAL = (35.6815, 139.7650)  # 東京駅 丸の内駅前広場 付近
 
 INF = float("inf")
@@ -377,56 +364,6 @@ def filter_render_data(data, edges, tol=2.0):
             "sidewalk": polygons_touching(roadway, data["sidewalk"], tol),
             "intersection": polygons_touching(roadway, data["intersection"],
                                               tol)}
-
-
-def add_moat_patch(data, proj, width=MOAT_PATCH_WIDTH):
-    """Inject the hand-traced connector for the 内堀通り data gap (宮内庁
-   管理道路 is absent from PLATEAU tran) as one synthetic carriageway
-    strip. meta['patch']=True marks it so every output can tell it apart
-    from real PLATEAU data. Returns (n_points, approx_length_m)."""
-    pts = [proj(lat, lon) for lat, lon in MOAT_PATCH]
-    # snap the eastern end onto the nearest existing carriageway /
-    # intersection vertex so the strip provably joins the graph (the ring's
-    # end cap then passes through a real vertex; touch tol is 1 m)
-    end = pts[-1]
-    refs = list(data["roadway"]) + list(data["intersection"])
-    grid = SegGrid(refs, 8.0)
-    best, bd = None, INF
-    for i, seg in grid.near(*end):
-        for q in ((seg[0], seg[1]), (seg[2], seg[3])):
-            d = math.hypot(q[0] - end[0], q[1] - end[1])
-            if d < bd:
-                best, bd = q, d
-    if best is not None and bd <= 80.0:
-        pts[-1] = best
-    # densify to ~20 m so plenty of ring vertices sit near the existing
-    # polygon soup at the eastern join (touch tolerance is 1 m)
-    dense = [pts[0]]
-    for a, b in zip(pts[:-1], pts[1:]):
-        seg = math.hypot(b[0] - a[0], b[1] - a[1])
-        steps = max(1, int(seg / 20))
-        dense.extend((a[0] + (b[0] - a[0]) * s / steps,
-                      a[1] + (b[1] - a[1]) * s / steps)
-                     for s in range(1, steps + 1))
-    pts = dense
-    n = len(pts)
-    left, right = [], []
-    for i, (x, y) in enumerate(pts):
-        if i == 0:
-            dx, dy = pts[1][0] - x, pts[1][1] - y
-        elif i == n - 1:
-            dx, dy = x - pts[i - 1][0], y - pts[i - 1][1]
-        else:
-            dx, dy = pts[i + 1][0] - pts[i - 1][0], pts[i + 1][1] - pts[i - 1][1]
-        ln = math.hypot(dx, dy) or 1.0
-        nx, ny = -dy / ln, dx / ln
-        left.append((x + nx * width / 2, y + ny * width / 2))
-        right.append((x - nx * width / 2, y - ny * width / 2))
-    data["roadway"].append(Poly(left + right[::-1],
-                                {"road_id": "#patch-moat",
-                                 "name": "内堀通り(補助線)",
-                                 "patch": True}))
-    return n, round(polyline_length(pts))
 
 
 def nearest_on_polyline(pts, p):
@@ -788,7 +725,6 @@ def build_graph(data, tol, min_edge, end_frac=0.2):
         p = strips[e["strip"]]
         e["name"] = p.meta.get("name")
         e["road_ids"] = [p.meta.get("road_id")]
-        e["patch"] = bool(p.meta.get("patch"))
 
     # --- 6. sidewalk attribution
     strip_sid_area = Counter()
@@ -1012,7 +948,6 @@ def to_geojson(nodes, edges, unproj, meta):
                 "length_m": round(e["length"], 1),
                 "street_name": e.get("name"),
                 "sidewalk_area_m2": round(e.get("sidewalk_area", 0.0), 1),
-                "patch": e.get("patch", False),
                 "sidewalk_polys": e.get("sidewalk_polys", 0),
                 "walkable": True,
                 "component": e["component"],
@@ -1075,11 +1010,7 @@ def render_svg(nodes, edges, polys_by_kind, out_path, stats_line, paths=None,
     main = Counter(e["component"] for e in edges).most_common(1)
     main = main[0][0] if main else -1
     for e in edges:
-        if e.get("patch"):
-            o.append(f'<path d="{path_d(e["pts"])}" fill="none" '
-                     f'stroke="#1971c2" stroke-width="4" '
-                     f'stroke-dasharray="12 7" stroke-linecap="round"/>')
-        elif e["component"] == main:
+        if e["component"] == main:
             o.append(f'<path d="{path_d(e["pts"])}" fill="none" '
                      f'stroke="{SVG_COLORS["edge"]}" stroke-width="4" '
                      f'stroke-linecap="round"/>')
@@ -1126,8 +1057,7 @@ def render_svg(nodes, edges, polys_by_kind, out_path, stats_line, paths=None,
               ("rect", SVG_COLORS["sidewalk"], "歩道部"),
               ("circle", SVG_COLORS["node"], "交差点ノード"),
               ("line", SVG_COLORS["edge"], "主グラフ辺"),
-              ("line", SVG_COLORS["edge_alt"], "他の連結成分"),
-              ("line", "#1971c2", "補助線(欠損区間)")]
+              ("line", SVG_COLORS["edge_alt"], "他の連結成分")]
     for kind, col, label in legend:
         if kind == "rect":
             o.append(f'<rect x="{lx}" y="{ly - 12}" width="18" height="12" '
@@ -1251,17 +1181,6 @@ def selftest():
     assert cstats["notes"]["dropped_off_corridor"] == 1, cstats
     assert cstats["notes"]["isolated_nodes_dropped"] == 2, cstats
 
-    # moat patch: deterministic synthetic strip, flagged patch=True,
-    # width ~= MOAT_PATCH_WIDTH
-    proj_p, _ = make_projector(*ORIGIN)
-    d_patch = {"intersection": [], "roadway": [], "sidewalk": []}
-    npts, plen = add_moat_patch(d_patch, proj_p)
-    assert len(d_patch["roadway"]) == 1 and d_patch["roadway"][0].meta["patch"]
-    strip = d_patch["roadway"][0]
-    w_patch = strip.area / strip_axis(strip)[2]
-    assert 8 < w_patch < 12, w_patch
-    assert 500 < plen < 800, plen  # 大手門〜データ西端 is ~600 m
-
     print(f"selftest OK (nodes={len(g['nodes'])} edges={len(g['edges'])} "
           f"I->J={dist[dst]:.1f}m)")
     return True
@@ -1296,9 +1215,6 @@ def main():
                     help="keep only edges within this many metres of the "
                          "k-shortest 開始→駅 bundle (回廊フィルタ); "
                          "0 keeps everything")
-    ap.add_argument("--no-patch", action="store_true",
-                    help="skip the hand-traced 内堀通り connector "
-                         "(data purity runs)")
     ap.add_argument("--end-frac", type=float, default=0.2)
     ap.add_argument("--k", type=int, default=3)
     ap.add_argument("--start", default=f"{DEFAULT_START[0]},{DEFAULT_START[1]}",
@@ -1341,14 +1257,6 @@ def main():
               f"{nf['dropped_narrow']} narrow dropped / "
               f"{nf['dropped_excluded_name']} name-excluded, "
               f"sidewalks kept {nf['kept_sidewalks']}")
-    patch_info = None
-    if not args.no_patch:
-        npts, plen = add_moat_patch(data, proj)
-        patch_info = {"points": npts, "approx_length_m": plen,
-                      "width_m": MOAT_PATCH_WIDTH,
-                      "note": "内堀通り 大手門〜データ西端 (宮内庁管理道路)"
-                              " — 手書き補助線"}
-        print(f"  moat patch: ~{plen} m synthetic connector to 大手門")
     if counts["roads"] == 0:
         print("  !! no roads kept — check --bbox / mesh codes")
 
@@ -1412,7 +1320,6 @@ def main():
                    "min_width_m": args.min_width,
                    "excluded_names": args.exclude_name,
                    "corridor_band_m": args.corridor_band,
-                   "moat_patch": not args.no_patch,
                    "end_frac": args.end_frac, "origin_latlon": ORIGIN},
     }
     (out / "graph.geojson").write_text(
@@ -1424,7 +1331,6 @@ def main():
         "bbox_lonlat": bbox, "inputs": dict(counts),
         "major_filter": fstats,
         "corridor_filter": cstats,
-        "moat_patch": patch_info,
         "construction_notes": g["notes"],
         "intersections_merged": g["inter_nodes"],
         "graph": {

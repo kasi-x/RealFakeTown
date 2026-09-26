@@ -75,14 +75,13 @@ commands will be added once the project grows scenes and tests.
   longest strip is under 6 m are pruned — unnamed alleys median ~5.7 m vs
   trunks ≥10 m — plus `--exclude-name 首都高速` for the elevated
   expressway) and **corridor** (`GRAPH_CORRIDOR_BAND=200`: only edges
-  within 200 m of the k-shortest 皇居→東京駅 bundle survive; ~90 nodes /
-  123 edges / 8.7 km). `GRAPH_MIN_WIDTH=0 GRAPH_CORRIDOR_BAND=0` regenerates
+  within 200 m of the k-shortest 皇居→東京駅 bundle survive; ~88 nodes /
+  121 edges / 8 km). `GRAPH_MIN_WIDTH=0 GRAPH_CORRIDOR_BAND=0` regenerates
   the full 51 km graph. Known data gap: PLATEAU tran has **no road
   polygons along the palace east moat (内堀通り, lon ≈ 139.753–139.760 —
   measured: zero carriageway polygons there; 宮内庁-managed roads are not
   open data and the G空間情報センター CKAN has no 皇居/宮内庁 dataset
-  either)**. The gap is bridged by a hand-traced synthetic connector
-  (`MOAT_PATCH`, rendered blue-dashed, marked `patch: true` in every
-  output; `--no-patch` disables it), so the default start is 大手門.
+  either)**, so the default start is パレスホテル前 (丸の内1-1) at the
+  data's western edge; the gate side is placed manually on the board.
 - `Library/`, `Temp/`, `Logs/`, `UserSettings/` are Unity-generated caches —
   never edit or commit them; they regenerate on open.
