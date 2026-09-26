@@ -77,7 +77,15 @@ commands will be added once the project grows scenes and tests.
   expressway) and **corridor** (`GRAPH_CORRIDOR_BAND=200`: only edges
   within 200 m of the k-shortest 皇居→東京駅 bundle survive; ~88 nodes /
   121 edges / 8 km). `GRAPH_MIN_WIDTH=0 GRAPH_CORRIDOR_BAND=0` regenerates
-  the full 51 km graph. Known data gap: PLATEAU tran has **no road
+  the full 51 km graph. **OSM attribute overlay** (`--osm auto`, cached at
+  `artifacts/city_graph/osm-cache.json`, `--refresh-osm` to re-download):
+  PLATEAU tran has no oneway/crosswalk information, so edges borrow
+  `oneway` (+direction) from nearby bearing-aligned OSM ways (one-way
+  votes must outweigh two-way votes) and OSM crossing/signals nodes become
+  per-edge `crossings` points and per-intersection `crossings` counts.
+  The graph stays undirected — oneway constrains cars, not the walker.
+  OSM data is © OpenStreetMap contributors (ODbL) and must stay attributed
+  in any derivative. Known data gap: PLATEAU tran has **no road
   polygons along the palace east moat (内堀通り, lon ≈ 139.753–139.760 —
   measured: zero carriageway polygons there; 宮内庁-managed roads are not
   open data and the G空間情報センター CKAN has no 皇居/宮内庁 dataset

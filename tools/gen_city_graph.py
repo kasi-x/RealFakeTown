@@ -55,6 +55,8 @@ import shutil
 import statistics
 import subprocess
 import sys
+import urllib.parse
+import urllib.request
 import xml.etree.ElementTree as ET
 from collections import Counter, defaultdict
 from datetime import date
@@ -923,6 +925,166 @@ def snap_node(nodes, xy, max_dist=300.0):
     return pick, pd
 
 
+# ------------------------------------------------------- OSM attribute overlay
+
+OSM_ATTRIBUTION = "© OpenStreetMap contributors (ODbL)"
+OVERPASS_ENDPOINTS = (
+    "https://overpass-api.de/api/interpreter",
+    "https://maps.mail.ru/osm/tools/overpass/api/interpreter",
+    "https://overpass.kumi.systems/api/interpreter",
+)
+VEHICULAR_HIGHWAYS = {
+    "motorway", "motorway_link", "trunk", "trunk_link", "primary",
+    "primary_link", "secondary", "secondary_link", "tertiary",
+    "tertiary_link", "residential", "unclassified", "living_street",
+    "service", "road",
+}
+
+
+def fetch_osm_cache(bbox, cache_path, refresh=False):
+    """Download OSM vehicular highways + crossing nodes for the bbox via
+    the Overpass API (cached to cache_path; refresh=True re-downloads).
+    PLATEAU tran has neither oneway nor crosswalk information, so the
+    overlay borrows these two attributes from OSM. Returns parsed JSON,
+    or None when every endpoint fails (the graph is then built without
+    the overlay)."""
+    if cache_path.exists() and not refresh:
+        return json.loads(cache_path.read_text())
+    b = f"{bbox[1]},{bbox[0]},{bbox[3]},{bbox[2]}"  # south,west,north,east
+    query = ('[out:json][timeout:120];('
+             f'way["highway"]({b});'
+             f'node["highway"="crossing"]({b});'
+             f'node["highway"="traffic_signals"]({b});'
+             ');out geom;')
+    data = urllib.parse.urlencode({"data": query}).encode()
+    for url in OVERPASS_ENDPOINTS:
+        try:
+            req = urllib.request.Request(url, data=data, headers={
+                "User-Agent": "RealFakeTown board generator",
+                "Accept": "application/json"})
+            with urllib.request.urlopen(req, timeout=180) as r:
+                raw = r.read()
+            parsed = json.loads(raw)
+            cache_path.write_bytes(raw)
+            host = urllib.parse.urlparse(url).netloc
+            print(f"  osm: {len(parsed.get('elements', []))} elements "
+                  f"from {host}")
+            return parsed
+        except Exception as e:
+            host = urllib.parse.urlparse(url).netloc
+            print(f"  osm: {host} failed ({e})")
+    return None
+
+
+def _bearing_deg(dx, dy):
+    return math.degrees(math.atan2(dx, dy)) % 360.0
+
+
+def _bearing_gap(a, b):
+    d = abs(a - b) % 360.0
+    return d if d <= 180.0 else 360.0 - d
+
+
+def enrich_with_osm(nodes, edges, proj, osm):
+    """Spatial attribute transfer from OSM onto the graph — proximity and
+    bearing matching only, no identity matching. Vehicular OSM ways within
+    15 m lend their oneway tag to an edge (oneway_dir records which node
+    order the restriction allows: 'ab' = a→b); crossing / traffic_signals
+    nodes within 12 m become crossing points on that edge, and intersection
+    nodes count the crossings within 25 m. The graph itself stays
+    undirected — the walker is unaffected by oneway (it constrains cars
+    and shapes the crossing design). Returns (nodes, edges, stats)."""
+    veh = []
+    crossings = []
+    for el in osm.get("elements", []):
+        tags = el.get("tags", {})
+        if el["type"] == "way" and "geometry" in el:
+            if tags.get("highway") in VEHICULAR_HIGHWAYS:
+                veh.append({"pts": [proj(p["lat"], p["lon"])
+                                    for p in el["geometry"]],
+                            "oneway": tags.get("oneway", "")})
+        elif el["type"] == "node":
+            hv = tags.get("highway")
+            if hv in ("crossing", "traffic_signals"):
+                crossings.append((proj(el["lat"], el["lon"]),
+                                  "signals" if hv == "traffic_signals"
+                                  else "crossing"))
+
+    cell = 30.0
+    seg_grid = defaultdict(list)
+    for wi, v in enumerate(veh):
+        p = v["pts"]
+        for k in range(len(p) - 1):
+            ax, ay = p[k]
+            bx, by = p[k + 1]
+            gx0, gx1 = sorted((int(ax // cell), int(bx // cell)))
+            gy0, gy1 = sorted((int(ay // cell), int(by // cell)))
+            for gx in range(gx0 - 1, gx1 + 2):
+                for gy in range(gy0 - 1, gy1 + 2):
+                    seg_grid[(gx, gy)].append((wi, ax, ay, bx, by))
+
+    # votes: aligned OSM segments vote 'ab'/'ba' when one-way-tagged,
+    # 'two' when two-way; an edge is one-way only when one-way votes
+    # outweigh two-way votes (a wide avenue has both nearby)
+    votes = defaultdict(Counter)
+    for ei, e in enumerate(edges):
+        a, b = e["pts"][0], e["pts"][-1]
+        eb = _bearing_deg(b[0] - a[0], b[1] - a[1])
+        for p in e["pts"]:
+            gx, gy = int(p[0] // cell), int(p[1] // cell)
+            for dx in (-1, 0, 1):
+                for dy in (-1, 0, 1):
+                    for wi, ax, ay, bx, by in seg_grid.get(
+                            (gx + dx, gy + dy), ()):
+                        ow = veh[wi]["oneway"]
+                        d, _ = point_seg_dist(p[0], p[1], ax, ay, bx, by)
+                        if d > 15.0:
+                            continue
+                        gap = _bearing_gap(eb, _bearing_deg(bx - ax, by - ay))
+                        if gap <= 45.0:
+                            k = "ab" if ow != "-1" else "ba"
+                        elif gap >= 135.0:
+                            k = "ba" if ow != "-1" else "ab"
+                        else:
+                            continue
+                        votes[ei][k if ow in ("yes", "1", "true", "-1")
+                                  else "two"] += 1
+    for ei, c in votes.items():
+        oneway_votes = c["ab"] + c["ba"]
+        if oneway_votes > c["two"]:
+            edges[ei]["oneway"] = True
+            edges[ei]["oneway_dir"] = c.most_common(1)[0][0]
+
+    for (cxy, kind) in crossings:
+        best_ei, best_d, best_q = None, INF, None
+        for ei, e in enumerate(edges):
+            t, d, q = nearest_on_polyline(e["pts"], cxy)
+            if d < best_d:
+                best_ei, best_d, best_q = ei, d, (t, q)
+        if best_ei is not None and best_d <= 12.0:
+            edges[best_ei].setdefault("crossings", []).append(
+                (best_q[1][0], best_q[1][1], kind))
+    for n in nodes:
+        if n["kind"] == "intersection":
+            n["crossings"] = sum(
+                1 for (cxy, _k) in crossings
+                if math.hypot(cxy[0] - n["pos"][0],
+                              cxy[1] - n["pos"][1]) <= 25.0)
+
+    stats = {
+        "attribution": OSM_ATTRIBUTION,
+        "oneway_edges": sum(1 for e in edges if e.get("oneway")),
+        "crossing_points": sum(len(e.get("crossings", ())) for e in edges),
+        "signal_points": sum(1 for e in edges for (_x, _y, k)
+                             in e.get("crossings", ()) if k == "signals"),
+        "intersections_with_crossing": sum(
+            1 for n in nodes if n.get("crossings")),
+        "osm_ways_matched": len(votes),
+        "osm_elements": len(osm.get("elements", [])),
+    }
+    return nodes, edges, stats
+
+
 # ------------------------------------------------------------ output
 
 def to_geojson(nodes, edges, unproj, meta):
@@ -934,12 +1096,17 @@ def to_geojson(nodes, edges, unproj, meta):
             "geometry": {"type": "Point",
                          "coordinates": [round(lon, 8), round(lat, 8)]},
             "properties": {k: n[k] for k in
-                           ("id", "kind", "degree", "component")}})
+                           ("id", "kind", "degree", "component")}
+            | {"crossings": n.get("crossings", 0)}})
     for i, e in enumerate(edges):
         coords = []
         for p in e["pts"]:
             lat, lon = unproj(*p)
             coords.append([round(lon, 8), round(lat, 8)])
+        crossings = []
+        for (x, y, kind) in e.get("crossings", ()):
+            lat, lon = unproj(x, y)
+            crossings.append([round(lon, 8), round(lat, 8), kind])
         feats.append({
             "type": "Feature",
             "geometry": {"type": "LineString", "coordinates": coords},
@@ -947,6 +1114,9 @@ def to_geojson(nodes, edges, unproj, meta):
                 "id": f"e{i}", "from": e["a"], "to": e["b"],
                 "length_m": round(e["length"], 1),
                 "street_name": e.get("name"),
+                "oneway": e.get("oneway", False),
+                "oneway_dir": e.get("oneway_dir"),
+                "crossings": crossings,
                 "sidewalk_area_m2": round(e.get("sidewalk_area", 0.0), 1),
                 "sidewalk_polys": e.get("sidewalk_polys", 0),
                 "walkable": True,
@@ -1019,6 +1189,37 @@ def render_svg(nodes, edges, polys_by_kind, out_path, stats_line, paths=None,
                      f'stroke="{SVG_COLORS["edge_alt"]}" stroke-width="3" '
                      f'stroke-dasharray="8 6"/>')
 
+    # crossing points (from OSM): short white ticks across the edge
+    for e in edges:
+        a, b = e["pts"][0], e["pts"][-1]
+        ln = math.hypot(b[0] - a[0], b[1] - a[1]) or 1.0
+        nx, ny = -(b[1] - a[1]) / ln, (b[0] - a[0]) / ln
+        for (x, y, _kind) in e.get("crossings", ()):
+            x0, y0 = tx((x - nx * 4.0, y - ny * 4.0))
+            x1, y1 = tx((x + nx * 4.0, y + ny * 4.0))
+            o.append(f'<line x1="{x0:.1f}" y1="{y0:.1f}" x2="{x1:.1f}" '
+                     f'y2="{y1:.1f}" stroke="#ffffff" stroke-width="2.5"/>')
+
+    # oneway edges: small orange arrowhead at the midpoint, oriented along
+    # the allowed direction
+    for e in edges:
+        if not e.get("oneway"):
+            continue
+        a, b = e["pts"][0], e["pts"][-1]
+        if e.get("oneway_dir") == "ba":
+            a, b = b, a
+        mx, my = (a[0] + b[0]) / 2, (a[1] + b[1]) / 2
+        ux, uy = b[0] - a[0], b[1] - a[1]
+        ln = math.hypot(ux, uy) or 1.0
+        ux, uy = ux / ln, uy / ln
+        nx, ny = -uy, ux
+        tip = tx((mx + ux * 6.0, my + uy * 6.0))
+        l1 = tx((mx - ux * 4.0 + nx * 4.0, my - uy * 4.0 + ny * 4.0))
+        l2 = tx((mx - ux * 4.0 - nx * 4.0, my - uy * 4.0 - ny * 4.0))
+        o.append(f'<polygon points="{tip[0]:.1f},{tip[1]:.1f} '
+                 f'{l1[0]:.1f},{l1[1]:.1f} {l2[0]:.1f},{l2[1]:.1f}" '
+                 f'fill="#f08c00"/>')
+
     # demo paths as node-to-node polylines
     by_id = {n["id"]: n["pos"] for n in nodes}
     for pi, (p, _cost) in enumerate(paths or []):
@@ -1057,7 +1258,9 @@ def render_svg(nodes, edges, polys_by_kind, out_path, stats_line, paths=None,
               ("rect", SVG_COLORS["sidewalk"], "歩道部"),
               ("circle", SVG_COLORS["node"], "交差点ノード"),
               ("line", SVG_COLORS["edge"], "主グラフ辺"),
-              ("line", SVG_COLORS["edge_alt"], "他の連結成分")]
+              ("line", SVG_COLORS["edge_alt"], "他の連結成分"),
+              ("line", "#ffffff", "横断歩道"),
+              ("line", "#f08c00", "一方通行")]
     for kind, col, label in legend:
         if kind == "rect":
             o.append(f'<rect x="{lx}" y="{ly - 12}" width="18" height="12" '
@@ -1181,6 +1384,21 @@ def selftest():
     assert cstats["notes"]["dropped_off_corridor"] == 1, cstats
     assert cstats["notes"]["isolated_nodes_dropped"] == 2, cstats
 
+    # osm overlay: synthetic oneway way along the I->J street + one
+    # crossing node — proximity and bearing matching only
+    osm = {"elements": [
+        {"type": "way", "tags": {"highway": "primary", "oneway": "yes"},
+         "geometry": [{"lat": 5.0, "lon": 8.0}, {"lat": 5.0, "lon": 45.0}]},
+        {"type": "node", "tags": {"highway": "crossing"},
+         "lat": 5.0, "lon": 20.0}]}
+    nodes_o, edges_o, osm_stats = enrich_with_osm(
+        [dict(n) for n in g["nodes"]], [dict(e) for e in g["edges"]],
+        lambda lat, lon: (lon, lat), osm)
+    ow = [e for e in edges_o if e.get("oneway")]
+    assert len(ow) == 2 and all(e["oneway_dir"] == "ab" for e in ow), ow
+    assert osm_stats["crossing_points"] == 1, osm_stats
+    assert sum(1 for n in nodes_o if n.get("crossings")) == 1, nodes_o
+
     print(f"selftest OK (nodes={len(g['nodes'])} edges={len(g['edges'])} "
           f"I->J={dist[dst]:.1f}m)")
     return True
@@ -1215,6 +1433,11 @@ def main():
                     help="keep only edges within this many metres of the "
                          "k-shortest 開始→駅 bundle (回廊フィルタ); "
                          "0 keeps everything")
+    ap.add_argument("--osm", choices=("auto", "off"), default="auto",
+                    help="overlay OSM attributes (oneway, crossings) onto "
+                         "the graph; auto downloads and caches once")
+    ap.add_argument("--refresh-osm", action="store_true",
+                    help="re-download the OSM cache even if present")
     ap.add_argument("--end-frac", type=float, default=0.2)
     ap.add_argument("--k", type=int, default=3)
     ap.add_argument("--start", default=f"{DEFAULT_START[0]},{DEFAULT_START[1]}",
@@ -1287,6 +1510,19 @@ def main():
         else:
             print("  !! corridor filter skipped (no start→goal path)")
 
+    # --- OSM attribute overlay: PLATEAU tran lacks oneway/crosswalk
+    # data, so borrow those two from OSM (cached; --osm off to skip)
+    osm_stats = None
+    if args.osm != "off" and bbox is not None:
+        osm = fetch_osm_cache(bbox, out / "osm-cache.json",
+                              refresh=args.refresh_osm)
+        if osm:
+            nodes, edges, osm_stats = enrich_with_osm(nodes, edges, proj, osm)
+            print(f"  osm overlay: {osm_stats['oneway_edges']} oneway "
+                  f"edges, {osm_stats['crossing_points']} crossing points")
+    elif args.osm != "off":
+        print("  osm overlay skipped (--bbox not set)")
+
     # --- corridor demo: 開始 -> 駅, k shortest paths on the final graph
     sn, sd = snap_node(nodes, proj(*start_ll), args.snap)
     gn, gd = snap_node(nodes, proj(*goal_ll), args.snap)
@@ -1320,6 +1556,7 @@ def main():
                    "min_width_m": args.min_width,
                    "excluded_names": args.exclude_name,
                    "corridor_band_m": args.corridor_band,
+                   "osm": args.osm,
                    "end_frac": args.end_frac, "origin_latlon": ORIGIN},
     }
     (out / "graph.geojson").write_text(
@@ -1331,6 +1568,7 @@ def main():
         "bbox_lonlat": bbox, "inputs": dict(counts),
         "major_filter": fstats,
         "corridor_filter": cstats,
+        "osm": osm_stats,
         "construction_notes": g["notes"],
         "intersections_merged": g["inter_nodes"],
         "graph": {
@@ -1356,6 +1594,9 @@ def main():
             line += f" / 大通りフィルタ 幅≥{args.min_width:g} m"
         if args.corridor_band > 0:
             line += f" / 回廊バンド {args.corridor_band:g} m"
+        if osm_stats:
+            line += (f" / 横断歩道 {osm_stats['crossing_points']}・"
+                     f"一方通行 {osm_stats['oneway_edges']}辺 (OSM)")
         if paths:
             line += f" / 開始→駅 最短 {paths[0][1] / 1000:.2f} km"
         svg = out / "city-graph.svg"
