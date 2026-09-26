@@ -361,7 +361,8 @@ def filter_render_data(data, edges, tol=2.0):
     """Trim the debug-render polygons down to roads that survived the
     corridor prune (edge["strip"] indexes data["roadway"])."""
     strips = data["roadway"]
-    kept_ids = {strips[e["strip"]].meta.get("road_id") for e in edges}
+    kept_ids = {strips[i].meta.get("road_id") for e in edges
+                for i in e.get("strips", ())}
     roadway = [p for p in strips if p.meta.get("road_id") in kept_ids]
     return {"roadway": roadway,
             "sidewalk": polygons_touching(roadway, data["sidewalk"], tol),
@@ -723,9 +724,9 @@ def build_graph(data, tol, min_edge, end_frac=0.2, merge_tol=15.0):
                 continue
             edges.append({"a": na if k == 0 else seq[k],
                           "b": nb if k == len(seq) - 2 else seq[k + 1],
-                          "pts": dedup, "length": ln, "strip": si})
+                          "pts": dedup, "length": ln, "strips": [si]})
     for e in edges:
-        p = strips[e["strip"]]
+        p = strips[e["strips"][0]]
         e["name"] = p.meta.get("name")
         e["road_ids"] = [p.meta.get("road_id")]
 
@@ -738,8 +739,10 @@ def build_graph(data, tol, min_edge, end_frac=0.2, merge_tol=15.0):
             strip_sid_area[si] += walks[wi].area
             strip_sid_count[si] += 1
     for e in edges:
-        e["sidewalk_area"] = strip_sid_area.get(e["strip"], 0.0)
-        e["sidewalk_polys"] = strip_sid_count.get(e["strip"], 0)
+        e["sidewalk_area"] = sum(strip_sid_area.get(i, 0.0)
+                                 for i in e["strips"])
+        e["sidewalk_polys"] = sum(strip_sid_count.get(i, 0)
+                                  for i in e["strips"])
 
     # --- 7. merge nodes closer than merge_tol (junction duplication
     # cleanup; wide roads scatter strip endpoints tens of metres around the
@@ -1119,6 +1122,149 @@ def enrich_with_osm(nodes, edges, proj, osm):
     return nodes, edges, stats
 
 
+# ------------------------------------------------------- graph simplification
+
+def simplify_graph(nodes, edges, protected):
+    """Puzzle-scale reduction: peel dead-end chains, then contract every
+    unprotected node with exactly two touching edges into one polyline
+    (dual-carriageway lobes — both edges to the same neighbour — peel
+    instead). OSM attributes carry through: crossings concatenate, oneway
+    survives only when both sides agree on the same direction. Protected
+    nodes (開始 / 駅) keep their ids. Returns (nodes, edges, stats)."""
+    notes = {"peeled_edges": 0, "contracted_nodes": 0, "lobes_peeled": 0}
+    alive = {e["a"] for e in edges} | {e["b"] for e in edges}
+    nodes = [n for n in nodes if n["id"] in alive]
+    edge_count = Counter()
+    for e in edges:
+        edge_count[e["a"]] += 1
+        edge_count[e["b"]] += 1
+
+    def flip(dr):
+        return {"ab": "ba", "ba": "ab"}.get(dr, dr)
+
+    # 1. peel dead-end chains: drop edges whose leaf end is unprotected
+    while True:
+        hit = None
+        for e in edges:
+            for nid in (e["a"], e["b"]):
+                if nid not in protected and edge_count[nid] == 1:
+                    hit = (e, nid)
+                    break
+            if hit:
+                break
+        if hit is None:
+            break
+        e, leaf = hit
+        other = e["b"] if e["a"] == leaf else e["a"]
+        edges.remove(e)
+        edge_count[leaf] -= 1
+        edge_count[other] -= 1
+        alive.discard(leaf)
+        nodes = [n for n in nodes if n["id"] != leaf]
+        if edge_count[other] == 0 and other not in protected:
+            alive.discard(other)  # isolated two-node component
+            nodes = [n for n in nodes if n["id"] != other]
+        notes["peeled_edges"] += 1
+
+    # 2. contract unprotected nodes with exactly two touching edges
+    while True:
+        target = next((nid for nid in alive if nid not in protected
+                       and edge_count[nid] == 2), None)
+        if target is None:
+            break
+        e1, e2 = [e for e in edges
+                  if e["a"] == target or e["b"] == target]
+
+        def run(e, from_target):
+            """(other_end, pts, dir): pts run u->target when from_target is
+            False, target->w when True; oneway_dir is expressed in the
+            returned polyline's own frame."""
+            if from_target:
+                if e["a"] == target:
+                    return e["b"], list(e["pts"]), e.get("oneway_dir")
+                return (e["a"], list(reversed(e["pts"])),
+                        flip(e.get("oneway_dir")))
+            if e["b"] == target:
+                return e["a"], list(e["pts"]), e.get("oneway_dir")
+            return e["b"], list(reversed(e["pts"])), flip(e.get("oneway_dir"))
+
+        u, pts1, d1 = run(e1, False)   # u -> target
+        w, pts2, d2 = run(e2, True)    # target -> w
+        edges = [e for e in edges if e is not e1 and e is not e2]
+        if u == w:
+            # dual-carriageway lobe: both strips run to the same neighbour
+            notes["peeled_edges"] += 2
+            notes["lobes_peeled"] += 1
+            alive.discard(target)
+            nodes = [n for n in nodes if n["id"] != target]
+            continue
+        merged_pts = pts1[:-1] + pts2
+        dedup = [merged_pts[0]]
+        for q in merged_pts[1:]:
+            if math.hypot(q[0] - dedup[-1][0], q[1] - dedup[-1][1]) > 0.05:
+                dedup.append(q)
+        ow1 = e1.get("oneway", False) and d1 is not None
+        ow2 = e2.get("oneway", False) and d2 is not None
+        same_dir = ow1 and ow2 and d1 == d2
+        cr1 = (e1.get("crossings", []) if e1["b"] == target
+               else list(reversed(e1.get("crossings", []))))
+        cr2 = (e2.get("crossings", []) if e2["a"] == target
+               else list(reversed(e2.get("crossings", []))))
+        merged = {
+            "a": u, "b": w, "pts": dedup,
+            "length": polyline_length(dedup),
+            "name": max(e1, e2, key=lambda e: e["length"]).get("name"),
+            "strips": e1.get("strips", []) + e2.get("strips", []),
+            "oneway": same_dir,
+            "oneway_dir": d1 if same_dir else None,
+            "crossings": cr1 + cr2,
+            "sidewalk_area": (e1.get("sidewalk_area", 0.0)
+                              + e2.get("sidewalk_area", 0.0)),
+            "sidewalk_polys": (e1.get("sidewalk_polys", 0)
+                               + e2.get("sidewalk_polys", 0)),
+            "road_ids": list(dict.fromkeys(
+                e1.get("road_ids", []) + e2.get("road_ids", []))),
+            "component": e1["component"],
+        }
+        edges.append(merged)
+        edge_count[target] -= 2
+        edge_count[u] += 1
+        edge_count[w] += 1
+        alive.discard(target)
+        nodes = [n for n in nodes if n["id"] != target]
+        notes["contracted_nodes"] += 1
+
+    # refresh degrees + components
+    deg = Counter()
+    adj = defaultdict(list)
+    for e in edges:
+        deg[e["a"]] += 1
+        deg[e["b"]] += 1
+        adj[e["a"]].append(e["b"])
+        adj[e["b"]].append(e["a"])
+    comp = {}
+    cid = 0
+    for n in nodes:
+        if n["id"] in comp:
+            continue
+        stack = [n["id"]]
+        while stack:
+            u = stack.pop()
+            if u in comp:
+                continue
+            comp[u] = cid
+            stack.extend(v for v in adj.get(u, ()) if v not in comp)
+        cid += 1
+    for n in nodes:
+        n["degree"] = deg.get(n["id"], 0)
+        n["component"] = comp[n["id"]]
+    for e in edges:
+        e["component"] = comp[e["a"]]
+    stats = {"nodes_after": len(nodes), "edges_after": len(edges),
+             "notes": dict(notes)}
+    return nodes, edges, stats
+
+
 # ------------------------------------------------------------ output
 
 def to_geojson(nodes, edges, unproj, meta):
@@ -1439,6 +1585,16 @@ def selftest():
     assert osm_stats["crossing_points"] == 1, osm_stats
     assert sum(1 for n in nodes_o if n.get("crossings")) == 1, nodes_o
 
+    # simplify: dead ends peel, the degree-2 junction contracts, and the
+    # protected 開始/駅 nodes survive — one edge I->J remains
+    nodes_s, edges_s, sstats = simplify_graph(
+        [dict(n) for n in g["nodes"]], [dict(e) for e in g["edges"]],
+        {src, dst})
+    assert len(nodes_s) == 2, nodes_s
+    assert len(edges_s) == 1, edges_s
+    assert 40 < edges_s[0]["length"] < 55, edges_s[0]["length"]
+    assert sstats["notes"]["peeled_edges"] == 1, sstats
+
     print(f"selftest OK (nodes={len(g['nodes'])} edges={len(g['edges'])} "
           f"I->J={dist[dst]:.1f}m)")
     return True
@@ -1480,6 +1636,9 @@ def main():
                          "the graph; auto downloads and caches once")
     ap.add_argument("--refresh-osm", action="store_true",
                     help="re-download the OSM cache even if present")
+    ap.add_argument("--no-simplify", action="store_true",
+                    help="keep the full corridor graph (skip dead-end peel "
+                         "and degree-2 contraction)")
     ap.add_argument("--end-frac", type=float, default=0.2)
     ap.add_argument("--k", type=int, default=3)
     ap.add_argument("--start", default=f"{DEFAULT_START[0]},{DEFAULT_START[1]}",
@@ -1565,6 +1724,18 @@ def main():
     elif args.osm != "off":
         print("  osm overlay skipped (--bbox not set)")
 
+    # --- puzzle-scale simplification (keep 開始/駅 anchors alive)
+    simp_stats = None
+    sn0, _ = snap_node(nodes, proj(*start_ll), args.snap)
+    gn0, _ = snap_node(nodes, proj(*goal_ll), args.snap)
+    protected = {n["id"] for n in (sn0, gn0) if n}
+    if not args.no_simplify:
+        n0, e0 = len(nodes), len(edges)
+        nodes, edges, simp_stats = simplify_graph(nodes, edges, protected)
+        simp_stats.update({"nodes_before": n0, "edges_before": e0})
+        print(f"  simplify: nodes {n0} -> {len(nodes)}, "
+              f"edges {e0} -> {len(edges)}")
+
     # --- corridor demo: 開始 -> 駅, k shortest paths on the final graph
     sn, sd = snap_node(nodes, proj(*start_ll), args.snap)
     gn, gd = snap_node(nodes, proj(*goal_ll), args.snap)
@@ -1612,6 +1783,7 @@ def main():
         "major_filter": fstats,
         "corridor_filter": cstats,
         "osm": osm_stats,
+        "simplify": simp_stats,
         "construction_notes": g["notes"],
         "intersections_merged": g["inter_nodes"],
         "graph": {
