@@ -70,8 +70,12 @@ commands will be added once the project grows scenes and tests.
   tolerance), street edges from 車道部 polygons with diameter-pair
   centerlines, sidewalks become edge attributes. Lengths/positions are
   approximations — the authoritative network will come from the Unity-side
-  import later. Known data gap: PLATEAU tran has **no road polygons along
-  the palace east moat (内堀通り, lon ≈ 139.750–139.758)**, so graph demos
-  start at the data's western edge, not 大手門.
+  import later. `make graph` applies the **major-road filter by default**
+  (`GRAPH_MIN_WIDTH=8.0`: roads whose carriageway area / longest strip is
+  under 8 m are pruned, plus `--exclude-name 首都高速` for the elevated
+  expressway); pass `GRAPH_MIN_WIDTH=0` for the full 51 km graph. Known
+  data gap: PLATEAU tran has **no road polygons along the palace east moat
+  (内堀通り, lon ≈ 139.750–139.758)**, so graph demos start at the data's
+  western edge, not 大手門.
 - `Library/`, `Temp/`, `Logs/`, `UserSettings/` are Unity-generated caches —
   never edit or commit them; they regenerate on open.

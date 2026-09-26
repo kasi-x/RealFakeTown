@@ -18,6 +18,9 @@ Construction (v1, topology-first):
           mid-block branches as pseudo nodes.
   attrs - 歩道部 (2000/2020) polygons touching a strip -> sidewalk count /
           area per edge; street name from Road gml:name.
+  major - --min-width W keeps only carriageway strips >= W m wide (大通り);
+          --exclude-name drops roads by name substring (e.g. 首都高速).
+          Sidewalks not adjacent to a kept strip are dropped from the render.
   CRS   - input is EPSG:6697 (lat, lon, z per the axis order in the files);
           treated as WGS84 and projected to local meters around Marunouchi.
 
@@ -46,6 +49,7 @@ import heapq
 import json
 import math
 import shutil
+import statistics
 import subprocess
 import sys
 import xml.etree.ElementTree as ET
@@ -171,6 +175,83 @@ def polyline_length(pts):
     return sum(math.hypot(pts[i + 1][0] - pts[i][0],
                           pts[i + 1][1] - pts[i][1])
                for i in range(len(pts) - 1))
+
+
+def strip_axis(poly):
+    """Farthest-vertex pair and their distance — the approximation
+    build_graph uses for a roadway strip's centerline."""
+    c = poly.centroid
+    a = max(poly.pts, key=lambda q: (q[0] - c[0]) ** 2 + (q[1] - c[1]) ** 2)
+    b = max((q for q in poly.pts if q != a),
+            key=lambda q: (q[0] - a[0]) ** 2 + (q[1] - a[1]) ** 2)
+    return a, b, math.hypot(b[0] - a[0], b[1] - a[1])
+
+
+def filter_major_roads(data, min_width, exclude_names, tol=2.0):
+    """Keep only the trunk-road part of the parsed data (でかい車が通る
+    大通り). Width is estimated per Road feature — strips are fragmented,
+    so sum(carriageway area) / longest strip of the road is far more robust
+    than per-strip area/diameter. Roads whose name contains any exclude
+    substring (elevated expressways) are dropped. Sidewalks not adjacent to
+    a kept strip are dropped so the debug render matches the graph;
+    intersections pass through and build_graph drops the orphaned ones."""
+    notes = Counter({"dropped_excluded_name": 0, "dropped_narrow": 0,
+                     "kept_strips": 0, "kept_sidewalks": 0})
+    by_road = defaultdict(list)
+    for i, p in enumerate(data["roadway"]):
+        by_road[p.meta.get("road_id") or f"#anon{i}"].append(i)
+
+    keep_roads = set()
+    road_info = {}  # road_id -> (name, width, span)
+    for rid, idxs in by_road.items():
+        name = data["roadway"][idxs[0]].meta.get("name") or ""
+        if any(s in name for s in exclude_names if s):
+            notes["dropped_excluded_name"] += 1
+            continue
+        area = sum(data["roadway"][i].area for i in idxs)
+        span = max(strip_axis(data["roadway"][i])[2] for i in idxs)
+        w = area / span if span > 0 else 0.0
+        if min_width > 0 and w < min_width:
+            notes["dropped_narrow"] += 1
+            continue
+        keep_roads.add(rid)
+        road_info[rid] = (name, w, span)
+
+    kept_strips = [p for i, p in enumerate(data["roadway"])
+                   if (p.meta.get("road_id") or f"#anon{i}") in keep_roads]
+    kept_walks = []
+    if kept_strips and data["sidewalk"]:
+        grid = SegGrid(kept_strips, max(2.0, tol * 4))
+        keep = set()
+        for (_si, wi), _d in touch_pairs(kept_strips, data["sidewalk"],
+                                         tol, grid, None).items():
+            keep.add(wi)
+        kept_walks = [data["sidewalk"][wi] for wi in sorted(keep)]
+    notes["kept_strips"] = len(kept_strips)
+    notes["kept_sidewalks"] = len(kept_walks)
+
+    name_w = defaultdict(list)
+    name_len = defaultdict(float)
+    name_roads = Counter()
+    for name, w, span in road_info.values():
+        key = name or "(無名)"
+        name_w[key].append(w)
+        name_len[key] += span
+        name_roads[key] += 1
+    stats = {
+        "min_width_m": min_width,
+        "excluded_names": list(exclude_names),
+        "notes": dict(notes),
+        "roads_kept": len(keep_roads),
+        "streets": {k: {"roads": name_roads[k],
+                        "median_width_m": round(statistics.median(v), 1),
+                        "approx_len_m": round(name_len[k])}
+                    for k, v in sorted(name_w.items(),
+                                       key=lambda kv: -name_len[kv[0]])},
+    }
+    return {"intersection": data["intersection"],
+            "roadway": kept_strips,
+            "sidewalk": kept_walks}, stats
 
 
 def nearest_on_polyline(pts, p):
@@ -404,13 +485,7 @@ def build_graph(data, tol, min_edge, end_frac=0.2):
             poly_to_inode[i] = ni
 
     # --- 2. strips: diameter-pair endpoints approximate the centerline
-    strip_ends = []
-    for p in strips:
-        c = p.centroid
-        a = max(p.pts, key=lambda q: (q[0] - c[0]) ** 2 + (q[1] - c[1]) ** 2)
-        b = max((q for q in p.pts if q != a),
-                key=lambda q: (q[0] - a[0]) ** 2 + (q[1] - a[1]) ** 2)
-        strip_ends.append((a, b))
+    strip_ends = [strip_axis(p)[:2] for p in strips]
 
     def diam(i):
         a, b = strip_ends[i]
@@ -959,6 +1034,25 @@ def selftest():
     paths = yen_k_shortest(adj, src, dst, 3)
     assert len(paths) == 1, paths              # only one route exists
 
+    # major-road filter: per-Road width (area/longest strip) — a wide road
+    # survives even when fragmented with slivers, narrow and excluded drop
+    fdata, fstats = filter_major_roads(
+        {"intersection": [],
+         "roadway": [Poly([(0, 0), (30, 0), (30, 12), (0, 12)],
+                          {"name": "国道1号", "road_id": "r1"}),
+                     Poly([(0, 0), (0.6, 0), (0.6, 12), (0, 12)],
+                          {"name": "国道1号", "road_id": "r1"}),  # sliver
+                     Poly([(0, 20), (30, 20), (30, 24), (0, 24)],
+                          {"name": "細道", "road_id": "r2"}),
+                     Poly([(0, 40), (30, 40), (30, 44), (0, 44)],
+                          {"name": "首都高速都心環状線", "road_id": "r3"})],
+         "sidewalk": [_poly_rect(0, 12, 30, 14)]},
+        min_width=10.0, exclude_names=("首都高速",))
+    assert len(fdata["roadway"]) == 2, fdata["roadway"]  # r1 both strips
+    assert fstats["roads_kept"] == 1, fstats
+    assert fstats["streets"]["国道1号"]["median_width_m"] > 10, fstats
+    assert fstats["notes"]["kept_sidewalks"] == 1, fstats
+
     print(f"selftest OK (nodes={len(g['nodes'])} edges={len(g['edges'])} "
           f"I->J={dist[dst]:.1f}m)")
     return True
@@ -983,6 +1077,12 @@ def main():
     ap.add_argument("--tol", type=float, default=1.0,
                     help="street-level touch tolerance in meters")
     ap.add_argument("--min-edge", type=float, default=3.0)
+    ap.add_argument("--min-width", type=float, default=0.0,
+                    help="keep only carriageway strips >= this width in m "
+                         "(大通りフィルタ); 0 keeps everything")
+    ap.add_argument("--exclude-name", action="append", default=[],
+                    help="drop roads whose name contains this substring "
+                         "(repeatable, e.g. 首都高速)")
     ap.add_argument("--end-frac", type=float, default=0.2)
     ap.add_argument("--k", type=int, default=3)
     ap.add_argument("--start", default=f"{DEFAULT_START[0]},{DEFAULT_START[1]}",
@@ -1016,6 +1116,15 @@ def main():
     print(f"  roads={counts['roads']} 交差部={counts['intersection']} "
           f"車道部={counts['roadway']} 歩道部={counts['sidewalk']} "
           f"ATA={counts['ata']}")
+    fstats = None
+    if args.min_width > 0 or args.exclude_name:
+        data, fstats = filter_major_roads(data, args.min_width,
+                                          args.exclude_name)
+        nf = fstats["notes"]
+        print(f"  major filter: strips {nf['kept_strips']} kept / "
+              f"{nf['dropped_narrow']} narrow dropped / "
+              f"{nf['dropped_excluded_name']} name-excluded, "
+              f"sidewalks kept {nf['kept_sidewalks']}")
     if counts["roads"] == 0:
         print("  !! no roads kept — check --bbox / mesh codes")
 
@@ -1056,6 +1165,8 @@ def main():
         "meshes": args.meshes,
         "bbox_lonlat": bbox,
         "params": {"tol_m": args.tol, "min_edge_m": args.min_edge,
+                   "min_width_m": args.min_width,
+                   "excluded_names": args.exclude_name,
                    "end_frac": args.end_frac, "origin_latlon": ORIGIN},
     }
     (out / "graph.geojson").write_text(
@@ -1065,6 +1176,7 @@ def main():
     stats = {
         "params": meta["params"], "meshes": args.meshes,
         "bbox_lonlat": bbox, "inputs": dict(counts),
+        "major_filter": fstats,
         "construction_notes": g["notes"],
         "intersections_merged": g["inter_nodes"],
         "graph": {
@@ -1086,6 +1198,8 @@ def main():
     if not args.no_svg:
         line = (f"nodes {len(nodes)} / edges {len(edges)} / "
                 f"{total_len / 1000:.1f} km / 連結成分 {len(comps)}")
+        if args.min_width > 0:
+            line += f" / 大通りフィルタ 幅≥{args.min_width:g} m"
         if paths:
             line += f" / 開始→駅 最短 {paths[0][1] / 1000:.2f} km"
         svg = out / "city-graph.svg"
@@ -1106,6 +1220,11 @@ def main():
     print(f"  kinds: {dict(Counter(n['kind'] for n in nodes))}")
     print(f"  degree: {dict(sorted(deg_hist.items()))}")
     print(f"  notes: {g['notes']}")
+    if fstats:
+        print("  kept streets (approx length / median width):")
+        for k, v in list(fstats["streets"].items())[:8]:
+            print(f"    {v['approx_len_m'] / 1000:5.2f} km / "
+                  f"~{v['median_width_m']:5.1f} m  {k}")
     if demo:
         for p in demo["paths"]:
             print(f"  path {p['rank']}: {p['length_m'] / 1000:.2f} km, "

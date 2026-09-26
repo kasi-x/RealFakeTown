@@ -14,6 +14,9 @@ CITYGML_UDX  := vendor/citygml/udx
 # 丸の内回廊 (皇居東側〜東京駅) — 3rd-mesh tran tiles
 GRAPH_MESHES := 53394611 53394620 53394621 53394610
 GRAPH_OUT    := artifacts/city_graph
+# 大通りフィルタ: roads with carriageway narrower than this are pruned
+# (0 = full graph incl. alleys); 首都高速 (elevated) is always excluded
+GRAPH_MIN_WIDTH ?= 8.0
 
 SDK_URL      := https://github.com/Project-PLATEAU/PLATEAU-SDK-for-Unity/releases/download/v4.3.0/PLATEAU-SDK-for-Unity-v4.3.0.0.tgz
 TOOLKITS_URL := https://github.com/Project-PLATEAU/PLATEAU-SDK-Toolkits-for-Unity/releases/download/v2.3.0/PLATEAU-SDK-Toolkits-for-Unity-v2.3.0.2.tgz
@@ -66,4 +69,5 @@ verify:
 # render into $(GRAPH_OUT); curated copies for docs live in docs/concepts.
 graph: $(CITYGML_UDX)
 	python3 tools/gen_city_graph.py $(GRAPH_MESHES) --root vendor/citygml \
-		--bbox marunouchi --out $(GRAPH_OUT)
+		--bbox marunouchi --min-width $(GRAPH_MIN_WIDTH) \
+		--exclude-name 首都高速 --out $(GRAPH_OUT)
