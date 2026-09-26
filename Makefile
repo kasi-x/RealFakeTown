@@ -15,8 +15,11 @@ CITYGML_UDX  := vendor/citygml/udx
 GRAPH_MESHES := 53394611 53394620 53394621 53394610
 GRAPH_OUT    := artifacts/city_graph
 # 大通りフィルタ: roads with carriageway narrower than this are pruned
-# (0 = full graph incl. alleys); 首都高速 (elevated) is always excluded
-GRAPH_MIN_WIDTH ?= 8.0
+# (0 = full graph incl. alleys); 首都高速 (elevated) is always excluded.
+# 回廊フィルタ: keep only edges within this many metres of the k-shortest
+# 皇居→東京駅 bundle (0 = keep everything the bbox clip left)
+GRAPH_MIN_WIDTH     ?= 6.0
+GRAPH_CORRIDOR_BAND ?= 200
 
 SDK_URL      := https://github.com/Project-PLATEAU/PLATEAU-SDK-for-Unity/releases/download/v4.3.0/PLATEAU-SDK-for-Unity-v4.3.0.0.tgz
 TOOLKITS_URL := https://github.com/Project-PLATEAU/PLATEAU-SDK-Toolkits-for-Unity/releases/download/v2.3.0/PLATEAU-SDK-Toolkits-for-Unity-v2.3.0.2.tgz
@@ -70,4 +73,5 @@ verify:
 graph: $(CITYGML_UDX)
 	python3 tools/gen_city_graph.py $(GRAPH_MESHES) --root vendor/citygml \
 		--bbox marunouchi --min-width $(GRAPH_MIN_WIDTH) \
-		--exclude-name 首都高速 --out $(GRAPH_OUT)
+		--exclude-name 首都高速 --corridor-band $(GRAPH_CORRIDOR_BAND) \
+		--out $(GRAPH_OUT)

@@ -21,6 +21,9 @@ Construction (v1, topology-first):
   major - --min-width W keeps only carriageway strips >= W m wide (大通り);
           --exclude-name drops roads by name substring (e.g. 首都高速).
           Sidewalks not adjacent to a kept strip are dropped from the render.
+  corridor - --corridor-band M keeps only edges within M m of the union of
+          the k-shortest 開始→駅 paths (回廊フィルタ; 0 = off). Nodes left
+          without edges are removed and degrees/components re-annotated.
   CRS   - input is EPSG:6697 (lat, lon, z per the axis order in the files);
           treated as WGS84 and projected to local meters around Marunouchi.
 
@@ -252,6 +255,113 @@ def filter_major_roads(data, min_width, exclude_names, tol=2.0):
     return {"intersection": data["intersection"],
             "roadway": kept_strips,
             "sidewalk": kept_walks}, stats
+
+
+def build_adj(edges):
+    adj = defaultdict(list)
+    for e in edges:
+        adj[e["a"]].append((e["b"], e["length"]))
+        adj[e["b"]].append((e["a"], e["length"]))
+    return adj
+
+
+def polygons_touching(ref, cands, tol=2.0):
+    if not ref or not cands:
+        return []
+    grid = SegGrid(ref, max(2.0, tol * 4))
+    keep = set()
+    for (_ri, ci), _d in touch_pairs(ref, cands, tol, grid, None).items():
+        keep.add(ci)
+    return [cands[i] for i in sorted(keep)]
+
+
+def corridor_edge_indices(edges, paths):
+    """Edge indices used by any of the k node paths (all parallel edges)."""
+    pair = defaultdict(set)
+    for i, e in enumerate(edges):
+        pair[(e["a"], e["b"])].add(i)
+        pair[(e["b"], e["a"])].add(i)
+    spine = set()
+    for p, _cost in paths:
+        for a, b in zip(p[:-1], p[1:]):
+            spine |= pair.get((a, b), set())
+    return spine
+
+
+def prune_to_corridor(nodes, edges, spine_idx, band):
+    """Drop every edge farther than band metres from the spine (the union
+    of the k-shortest 開始→駅 polylines), then remove nodes left without
+    edges and re-annotate degrees/components. Returns (nodes, edges, stats);
+    kept edges are remapped in place, so callers must use the returned
+    graph afterwards."""
+    notes = Counter({"dropped_off_corridor": 0, "isolated_nodes_dropped": 0})
+    spine_segs = []
+    for i in spine_idx:
+        pts = edges[i]["pts"]
+        spine_segs += list(zip(pts[:-1], pts[1:]))
+    kept = []
+    for i, e in enumerate(edges):
+        if i in spine_idx:
+            kept.append(e)
+            continue
+        d = min((point_seg_dist(p[0], p[1], a[0], a[1], b[0], b[1])[0]
+                 for p in e["pts"] for a, b in spine_segs), default=INF)
+        if d <= band:
+            kept.append(e)
+        else:
+            notes["dropped_off_corridor"] += 1
+    used = sorted({e["a"] for e in kept} | {e["b"] for e in kept})
+    notes["isolated_nodes_dropped"] = len(nodes) - len(used)
+    remap = {old: new for new, old in enumerate(used)}
+    nodes2 = []
+    for new, old in enumerate(used):
+        n = dict(nodes[old])
+        n["id"] = new
+        nodes2.append(n)
+    for e in kept:
+        e["a"] = remap[e["a"]]
+        e["b"] = remap[e["b"]]
+    deg = Counter()
+    for e in kept:
+        deg[e["a"]] += 1
+        deg[e["b"]] += 1
+    adj = defaultdict(list)
+    for e in kept:
+        adj[e["a"]].append(e["b"])
+        adj[e["b"]].append(e["a"])
+    comp = {}
+    cid = 0
+    for n in nodes2:
+        if n["id"] in comp:
+            continue
+        stack = [n["id"]]
+        while stack:
+            u = stack.pop()
+            if u in comp:
+                continue
+            comp[u] = cid
+            stack.extend(v for v in adj.get(u, ()) if v not in comp)
+        cid += 1
+    for n in nodes2:
+        n["degree"] = deg.get(n["id"], 0)
+        n["component"] = comp[n["id"]]
+    for e in kept:
+        e["component"] = comp[e["a"]]
+    stats = {"band_m": band, "edges_kept": len(kept),
+             "nodes_kept": len(nodes2), "notes": dict(notes)}
+    return nodes2, kept, stats
+
+
+def filter_render_data(data, edges, tol=2.0):
+    """Trim the debug-render polygons down to roads that survived the
+    corridor prune (edge["strip"] indexes data["roadway"])."""
+    strips = data["roadway"]
+    kept_ids = {strips[e["strip"]].meta.get("road_id") for e in edges}
+    roadway = [p for p in strips if p.meta.get("road_id") in kept_ids]
+    return {"roadway": roadway,
+            "sidewalk": polygons_touching(roadway, data["sidewalk"], tol),
+            "intersection": polygons_touching(roadway, data["intersection"],
+                                              tol)}
 
 
 def nearest_on_polyline(pts, p):
@@ -1053,6 +1163,17 @@ def selftest():
     assert fstats["streets"]["国道1号"]["median_width_m"] > 10, fstats
     assert fstats["notes"]["kept_sidewalks"] == 1, fstats
 
+    # corridor prune: the far dead end (D, ~12 m off the I->J path) drops,
+    # the on-path edges and their nodes survive
+    p1 = yen_k_shortest(build_adj(g["edges"]), src, dst, 1)
+    nodes_c, edges_c, cstats = prune_to_corridor(
+        g["nodes"], g["edges"],
+        corridor_edge_indices(g["edges"], p1), band=5.0)
+    assert len(edges_c) == 2, edges_c          # the two I->J strips
+    assert len(nodes_c) == 3, nodes_c          # I, mid junction, J
+    assert cstats["notes"]["dropped_off_corridor"] == 1, cstats
+    assert cstats["notes"]["isolated_nodes_dropped"] == 2, cstats
+
     print(f"selftest OK (nodes={len(g['nodes'])} edges={len(g['edges'])} "
           f"I->J={dist[dst]:.1f}m)")
     return True
@@ -1083,6 +1204,10 @@ def main():
     ap.add_argument("--exclude-name", action="append", default=[],
                     help="drop roads whose name contains this substring "
                          "(repeatable, e.g. 首都高速)")
+    ap.add_argument("--corridor-band", type=float, default=0.0,
+                    help="keep only edges within this many metres of the "
+                         "k-shortest 開始→駅 bundle (回廊フィルタ); "
+                         "0 keeps everything")
     ap.add_argument("--end-frac", type=float, default=0.2)
     ap.add_argument("--k", type=int, default=3)
     ap.add_argument("--start", default=f"{DEFAULT_START[0]},{DEFAULT_START[1]}",
@@ -1132,21 +1257,35 @@ def main():
     g = build_graph(data, tol=args.tol, min_edge=args.min_edge,
                     end_frac=args.end_frac)
     nodes, edges = g["nodes"], g["edges"]
-    total_len = sum(e["length"] for e in edges)
-    deg_hist = Counter(n["degree"] for n in nodes)
-    comps = Counter(n["component"] for n in nodes)
-
-    # --- corridor demo: 開始 -> 駅, k shortest paths
     start_ll, goal_ll = parse_latlon(args.start), parse_latlon(args.goal)
+
+    # --- corridor prune: first find the k-shortest 開始→駅 bundle on the
+    # full graph, then drop edges too far from it
+    cstats = None
+    if args.corridor_band > 0:
+        sn0, _ = snap_node(nodes, proj(*start_ll), args.snap)
+        gn0, _ = snap_node(nodes, proj(*goal_ll), args.snap)
+        p0 = (yen_k_shortest(build_adj(edges), sn0["id"], gn0["id"], args.k)
+              if sn0 and gn0 else [])
+        if p0:
+            spine = corridor_edge_indices(edges, p0)
+            n0, e0 = len(nodes), len(edges)
+            nodes, edges, cstats = prune_to_corridor(nodes, edges, spine,
+                                                     args.corridor_band)
+            cstats.update({"nodes_before": n0, "edges_before": e0,
+                           "k": args.k, "spine_edges": len(spine)})
+            print(f"  corridor filter: edges {e0} -> {len(edges)} "
+                  f"({cstats['notes']['dropped_off_corridor']} off-corridor, "
+                  f"spine {len(spine)})")
+        else:
+            print("  !! corridor filter skipped (no start→goal path)")
+
+    # --- corridor demo: 開始 -> 駅, k shortest paths on the final graph
     sn, sd = snap_node(nodes, proj(*start_ll), args.snap)
     gn, gd = snap_node(nodes, proj(*goal_ll), args.snap)
     paths, demo = [], None
     if sn and gn:
-        adj = defaultdict(list)
-        for e in edges:
-            adj[e["a"]].append((e["b"], e["length"]))
-            adj[e["b"]].append((e["a"], e["length"]))
-        paths = yen_k_shortest(adj, sn["id"], gn["id"], args.k)
+        paths = yen_k_shortest(build_adj(edges), sn["id"], gn["id"], args.k)
         demo = {"start_latlon": start_ll, "goal_latlon": goal_ll,
                 "start_snap_m": round(sd, 1), "goal_snap_m": round(gd, 1),
                 "paths": [{"rank": i + 1, "length_m": round(c, 1),
@@ -1156,6 +1295,12 @@ def main():
     else:
         print(f"  !! start/goal snap failed (start {sd:.0f} m, "
               f"goal {gd:.0f} m from nearest node)")
+
+    total_len = sum(e["length"] for e in edges)
+    deg_hist = Counter(n["degree"] for n in nodes)
+    comps = Counter(n["component"] for n in nodes)
+    if cstats:
+        data = filter_render_data(data, edges, args.tol)
 
     # --- outputs
     meta = {
@@ -1167,6 +1312,7 @@ def main():
         "params": {"tol_m": args.tol, "min_edge_m": args.min_edge,
                    "min_width_m": args.min_width,
                    "excluded_names": args.exclude_name,
+                   "corridor_band_m": args.corridor_band,
                    "end_frac": args.end_frac, "origin_latlon": ORIGIN},
     }
     (out / "graph.geojson").write_text(
@@ -1177,6 +1323,7 @@ def main():
         "params": meta["params"], "meshes": args.meshes,
         "bbox_lonlat": bbox, "inputs": dict(counts),
         "major_filter": fstats,
+        "corridor_filter": cstats,
         "construction_notes": g["notes"],
         "intersections_merged": g["inter_nodes"],
         "graph": {
@@ -1200,6 +1347,8 @@ def main():
                 f"{total_len / 1000:.1f} km / 連結成分 {len(comps)}")
         if args.min_width > 0:
             line += f" / 大通りフィルタ 幅≥{args.min_width:g} m"
+        if args.corridor_band > 0:
+            line += f" / 回廊バンド {args.corridor_band:g} m"
         if paths:
             line += f" / 開始→駅 最短 {paths[0][1] / 1000:.2f} km"
         svg = out / "city-graph.svg"
