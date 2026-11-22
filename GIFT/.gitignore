@@ -1,0 +1,6 @@
+# GIFT が生成するもの（重い/派生物なのでコミットしない）
+project/
+vendor/
+out/
+.shim/
+*.log
